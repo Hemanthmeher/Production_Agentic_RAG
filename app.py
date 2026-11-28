@@ -1,34 +1,31 @@
 import streamlit as st
+
 from graph import app
+from indexing import _format_metadata, _get_doc_name
+from nodes import MAX_REWRITES, MissingAPIKeyError
 from utils import load_documents
 
 
 def get_doc_field(doc, field, default="N/A"):
-    """Safely extract fields whether doc is a dict or a LangChain Document, and metadata is a dict or str."""
+    """Safely extract a field from a dict or LangChain Document."""
     if not doc:
         return default
 
     if isinstance(doc, dict):
-        if field in doc and doc[field] is not None:
+        if doc.get(field) is not None:
             return doc[field]
 
         metadata = doc.get("metadata")
         if isinstance(metadata, dict):
             return metadata.get(field, default)
-        if isinstance(metadata, str) and metadata.strip():
-            # If metadata is raw text/string instead of a dict, return it cleanly as fallback
-            return metadata if field in ("short_summary", "main_topics", "summary") else default
-
         return default
 
-    # LangChain Document object fallback
     if field == "content":
         return getattr(doc, "page_content", default) or default
+
     metadata = getattr(doc, "metadata", None)
     if isinstance(metadata, dict):
         return metadata.get(field, default)
-    if isinstance(metadata, str) and metadata.strip():
-        return metadata if field in ("short_summary", "main_topics", "summary") else default
     return default
 
 
@@ -52,89 +49,92 @@ This system performs:
 """
 )
 
+
 # 3. Load Knowledge Base Documents
-documents = load_documents()
+@st.cache_data(show_spinner=False)
+def get_documents():
+    return load_documents()
+
+
+try:
+    documents = get_documents()
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
 
 with st.expander("📄 View Loaded Knowledge Base Documents"):
-    for doc in documents or []:
-        doc_name = get_doc_field(
-            doc,
-            "source",
-            get_doc_field(doc, "file_name", get_doc_field(doc, "document_name", "Unknown")),
-        )
-        st.write(f"**Document:** {doc_name}")
-        st.write(f"**Main Topic:** {get_doc_field(doc, 'main_topic')}")
-        st.write(f"**Short Summary:** {get_doc_field(doc, 'short_summary')}")
+    if not documents:
+        st.info("No PDF files were found in the `data/` folder.")
+    for doc in documents:
+        st.write(f"**Document:** {_get_doc_name(doc)}")
+        st.caption(_format_metadata(doc))
         st.divider()
 
 # 4. User Query Input
 question = st.text_input(
     "Ask your question",
-    placeholder="e.g., What are the key security policies for remote employees?",
+    placeholder="e.g., What are the key skills listed in this resume?",
 )
 
 # 5. Execute Agentic RAG Workflow
-if st.button("Run Agentic RAG"):
-    if question.strip():
+if st.button("Run Agentic RAG", type="primary"):
+    if not question.strip():
+        st.warning("Please enter a question.")
+        st.stop()
+
+    try:
         with st.spinner("Running Agentic RAG workflow..."):
-           result = app.invoke(
-    {
-        "query": question,
-        "question": question,
-        "documents": documents,
-    }
-)
-
-        st.success("Documents Loaded")
-        st.success("Retrieval Completed")
-
-        if result.get("rewritten_question"):
-            st.warning("Retrieval required query improvement.")
-            st.subheader("🔄 Query Improvement")
-            st.markdown(
-                f"""
-**Original Query**
-{result.get('query', question)}
-
-**Rewritten Query**
-{result.get('rewritten_question', '')}
-"""
+            result = app.invoke(
+                {
+                    "query": question,
+                    "question": question,
+                    "current_query": question,
+                    "documents": documents,
+                    "rewrite_count": 0,
+                }
             )
+    except MissingAPIKeyError as exc:
+        st.error(str(exc))
+        st.stop()
+    except Exception as exc:  # surface LLM / API failures instead of a traceback
+        st.error(f"Workflow failed: {exc}")
+        st.stop()
 
-        st.success("Retrieval Evaluation Passed")
-        st.success("Answer Generated")
+    if not documents:
+        st.warning("No documents are loaded, so the answer is not grounded in a knowledge base.")
 
-        # Final Answer
-        st.subheader("✨ Final AI Answer")
-        st.info(result.get("answer", "No answer generated."))
-
-        # Retrieval Reasoning
-        st.subheader("🧠 Retrieval Reasoning")
-        st.code(
-            result.get("retrieval_reasoning", "No reasoning available."),
-            language="text",
+    rewrite_count = int(result.get("rewrite_count") or 0)
+    if rewrite_count:
+        st.subheader("🔄 Query Improvement")
+        st.markdown(
+            f"**Original Query**\n\n{question}\n\n"
+            f"**Rewritten Query ({rewrite_count}/{MAX_REWRITES})**\n\n"
+            f"{result.get('rewritten_question') or result.get('current_query', '')}"
         )
 
-        # Retrieved Documents
-        with st.expander("📚 Retrieved Source Documents & Metadata"):
-            retrieved_docs = result.get("retrieved_documents") or []
-            if retrieved_docs:
-                for idx, doc in enumerate(retrieved_docs, start=1):
-                    source = get_doc_field(
-                        doc,
-                        "source",
-                        get_doc_field(doc, "file_name", get_doc_field(doc, "document_name", "Unknown")),
-                    )
-                    st.markdown(f"**{idx}. Source:** `{source}`")
-                    st.write(f"**Main Topic:** {get_doc_field(doc, 'main_topic')}")
-                    st.write(f"**Short Summary:** {get_doc_field(doc, 'short_summary')}")
-                    content = get_doc_field(
-                        doc, "content", get_doc_field(doc, "page_content", "")
-                    )
-                    if content:
-                        st.text(str(content)[:500] + "...")
-                    st.divider()
-            else:
-                st.write("No documents were retrieved.")
+    grade = str(result.get("retrieval_grade", "")).lower()
+    if grade == "yes":
+        st.success("Retrieval Evaluation Passed")
     else:
-        st.warning("Please enter a question.")
+        st.warning("Retrieval Evaluation Failed — the answer may be limited.")
+
+    st.subheader("✨ Final AI Answer")
+    st.info(result.get("answer") or "No answer generated.")
+
+    st.subheader("🧠 Retrieval Reasoning")
+    st.code(
+        result.get("retrieval_reasoning") or "No reasoning available.",
+        language="text",
+    )
+
+    with st.expander("📚 Retrieved Source Documents & Metadata"):
+        retrieved_docs = result.get("retrieved_documents") or []
+        if not retrieved_docs:
+            st.write("No documents were retrieved.")
+        for idx, doc in enumerate(retrieved_docs, start=1):
+            st.markdown(f"**{idx}. Source:** `{_get_doc_name(doc)}`")
+            st.caption(_format_metadata(doc))
+            content = get_doc_field(doc, "content", "")
+            if content:
+                st.text(str(content)[:500] + "...")
+            st.divider()

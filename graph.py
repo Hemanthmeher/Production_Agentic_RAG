@@ -1,18 +1,26 @@
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
 
 from State import AgentState
 from nodes import (
-    retrieve_documents,
-    grade_documents,
-    rewrite_query,
+    MAX_REWRITES,
     generate_answer,
+    grade_documents,
+    retrieve_documents,
+    rewrite_query,
 )
 
 
-def route_after_grading(state: AgentState):
-    grade = state.get("retrieval_grade", "no").strip().lower()
-    if grade == "yes":
+def route_after_grading(state: AgentState) -> str:
+    """Send good retrievals to the answer, and weak ones to query rewriting."""
+    grade = str(state.get("retrieval_grade", "no")).strip().lower()
+
+    if grade.startswith("yes"):
         return "generate_answer"
+
+    # Stop looping when the rewrite budget is exhausted.
+    if int(state.get("rewrite_count") or 0) >= MAX_REWRITES:
+        return "generate_answer"
+
     return "rewrite_query"
 
 
